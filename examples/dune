@@ -1,0 +1,4 @@
+(executable
+ (name basic)
+ (libraries neo4j_bolt lwt lwt.unix yojson)
+ (preprocess (pps lwt_ppx)))

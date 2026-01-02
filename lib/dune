@@ -1,0 +1,5 @@
+(library
+ (name neo4j_bolt)
+ (public_name neo4j_bolt)
+ (libraries lwt lwt.unix)
+ (preprocess (pps lwt_ppx)))

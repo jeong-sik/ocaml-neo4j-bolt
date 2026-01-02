@@ -1,0 +1,376 @@
+(** Neo4j Bolt Protocol Client for OCaml
+
+    Pure OCaml implementation of the Bolt protocol for Neo4j.
+    Supports Bolt 4.x/5.x protocol versions.
+
+    Reference: https://neo4j.com/docs/bolt/current/
+*)
+
+(** Bolt protocol constants *)
+let magic_bytes = "\x60\x60\xB0\x17"
+let default_port = 7687
+
+(** Bolt message tags - https://neo4j.com/docs/bolt/current/bolt/message/ *)
+module Tag = struct
+  (* Request tags *)
+  let hello = 0x01      (* HELLO - initialize connection *)
+  let goodbye = 0x02    (* GOODBYE - close connection *)
+  let reset = 0x0F      (* RESET - reset session state *)
+  let run = 0x10        (* RUN - execute Cypher query *)
+  let discard = 0x2F    (* DISCARD - discard pending results *)
+  let pull = 0x3F       (* PULL - fetch results *)
+  let begin_tx = 0x11   (* BEGIN - start transaction *)
+  let commit = 0x12     (* COMMIT - commit transaction *)
+  let rollback = 0x13   (* ROLLBACK - rollback transaction *)
+  let route = 0x66      (* ROUTE - routing info (cluster) *)
+  let logon = 0x6A      (* LOGON - re-authenticate *)
+  let logoff = 0x6B     (* LOGOFF - de-authenticate *)
+
+  (* Response tags *)
+  let success = 0x70    (* SUCCESS - operation succeeded *)
+  let record = 0x71     (* RECORD - result row *)
+  let ignored = 0x7E    (* IGNORED - request ignored *)
+  let failure = 0x7F    (* FAILURE - operation failed *)
+end
+
+(** Bolt version *)
+type version = {
+  major: int;
+  minor: int;
+}
+
+let version_to_int32 v =
+  Int32.logor
+    (Int32.shift_left (Int32.of_int v.minor) 8)
+    (Int32.of_int v.major)
+
+let int32_to_version n =
+  { major = Int32.to_int n land 0xFF;
+    minor = Int32.to_int (Int32.shift_right n 8) land 0xFF }
+
+(** Configuration *)
+type config = {
+  host: string;
+  port: int;
+  username: string;
+  password: string;
+  timeout_s: float;
+}
+
+let default_config = {
+  host = Sys.getenv_opt "NEO4J_HOST" |> Option.value ~default:"localhost";
+  port = (match Sys.getenv_opt "NEO4J_PORT" with
+    | Some p -> int_of_string_opt p |> Option.value ~default:7687
+    | None -> 7687);
+  username = Sys.getenv_opt "NEO4J_USERNAME" |> Option.value ~default:"neo4j";
+  password = Sys.getenv_opt "NEO4J_PASSWORD" |> Option.value ~default:"";
+  timeout_s = (match Sys.getenv_opt "NEO4J_TIMEOUT" with
+    | Some t -> float_of_string_opt t |> Option.value ~default:30.0
+    | None -> 30.0);
+}
+
+(** Connection state *)
+type connection = {
+  ic: Lwt_io.input_channel;
+  oc: Lwt_io.output_channel;
+  version: version;
+  timeout_s: float;
+  mutable server_info: (string * Packstream.value) list;
+}
+
+(** Error types *)
+type error =
+  | ConnectionError of string
+  | HandshakeError of string
+  | AuthError of string
+  | ProtocolError of string * string  (* code, message *)
+  | Timeout
+
+let error_to_string = function
+  | ConnectionError msg -> Printf.sprintf "Connection error: %s" msg
+  | HandshakeError msg -> Printf.sprintf "Handshake error: %s" msg
+  | AuthError msg -> Printf.sprintf "Auth error: %s" msg
+  | ProtocolError (code, msg) -> Printf.sprintf "Protocol error [%s]: %s" code msg
+  | Timeout -> "Request timeout"
+
+(** Write bytes with chunking (Bolt uses 16-bit size prefix) *)
+let write_message oc (msg : bytes) =
+  let len = Bytes.length msg in
+  (* Chunk the message (max chunk size is 65535) *)
+  let rec write_chunks offset =
+    if offset >= len then
+      (* End marker: zero-length chunk *)
+      let%lwt () = Lwt_io.BE.write_int16 oc 0 in
+      Lwt_io.flush oc
+    else
+      let chunk_size = min (len - offset) 65535 in
+      let%lwt () = Lwt_io.BE.write_int16 oc chunk_size in
+      let%lwt () = Lwt_io.write_from_exactly oc msg offset chunk_size in
+      write_chunks (offset + chunk_size)
+  in
+  write_chunks 0
+
+(** Read a complete message (handle chunking) with timeout *)
+let read_message ~timeout_s ic =
+  let buffer = Buffer.create 256 in
+  let rec read_chunks () =
+    let%lwt chunk_size = Lwt_io.BE.read_int16 ic in
+    if chunk_size = 0 then
+      Lwt.return_ok (Buffer.to_bytes buffer)
+    else begin
+      let chunk = Bytes.create chunk_size in
+      let%lwt () = Lwt_io.read_into_exactly ic chunk 0 chunk_size in
+      Buffer.add_bytes buffer chunk;
+      read_chunks ()
+    end
+  in
+  (* Apply timeout *)
+  Lwt.pick [
+    read_chunks ();
+    (let%lwt () = Lwt_unix.sleep timeout_s in Lwt.return_error Timeout)
+  ]
+
+(** Perform Bolt handshake *)
+let handshake ic oc =
+  (* Send magic bytes *)
+  let%lwt () = Lwt_io.write oc magic_bytes in
+
+  (* Send 4 version proposals (we support 5.0, 4.4, 4.3, 4.0) *)
+  let versions = [
+    { major = 5; minor = 0 };
+    { major = 4; minor = 4 };
+    { major = 4; minor = 3 };
+    { major = 4; minor = 0 };
+  ] in
+  let%lwt () = Lwt_list.iter_s (fun v ->
+    Lwt_io.BE.write_int32 oc (version_to_int32 v)
+  ) versions in
+  let%lwt () = Lwt_io.flush oc in
+
+  (* Read server's chosen version *)
+  let%lwt chosen = Lwt_io.BE.read_int32 ic in
+  if chosen = 0l then
+    Lwt.return_error (HandshakeError "Server rejected all protocol versions")
+  else
+    let version = int32_to_version chosen in
+    Lwt.return_ok version
+
+(** Send a Bolt message *)
+let send_message oc tag fields =
+  let msg = Packstream.Structure (tag, fields) in
+  let packed = Packstream.pack msg in
+  write_message oc packed
+
+(** Receive a Bolt message with timeout *)
+let recv_message ~timeout_s ic =
+  let%lwt data_result = read_message ~timeout_s ic in
+  match data_result with
+  | Error e -> Lwt.return_error e
+  | Ok data ->
+    try
+      let value = Packstream.unpack data in
+      match value with
+      | Packstream.Structure (tag, fields) -> Lwt.return_ok (tag, fields)
+      | _ -> Lwt.return_error (ProtocolError ("UNEXPECTED", "Expected structure"))
+    with exn ->
+      Lwt.return_error (ProtocolError ("PARSE", Printexc.to_string exn))
+
+(** Send HELLO message and authenticate *)
+let authenticate conn ~username ~password =
+  let extra = Packstream.Map [
+    ("user_agent", Packstream.String "neo4j-bolt-ocaml/1.0");
+    ("scheme", Packstream.String "basic");
+    ("principal", Packstream.String username);
+    ("credentials", Packstream.String password);
+  ] in
+  let%lwt () = send_message conn.oc Tag.hello [extra] in
+  let%lwt response = recv_message ~timeout_s:conn.timeout_s conn.ic in
+  match response with
+  | Ok (tag, fields) when tag = Tag.success ->
+    (match fields with
+     | [Packstream.Map server_info] ->
+       Lwt.return_ok { conn with server_info }
+     | _ ->
+       Lwt.return_ok conn)
+  | Ok (tag, fields) when tag = Tag.failure ->
+    let code = match fields with
+      | [Packstream.Map m] ->
+        (match List.assoc_opt "code" m with
+         | Some (Packstream.String c) -> c
+         | _ -> "UNKNOWN")
+      | _ -> "UNKNOWN"
+    in
+    let message = match fields with
+      | [Packstream.Map m] ->
+        (match List.assoc_opt "message" m with
+         | Some (Packstream.String msg) -> msg
+         | _ -> "Authentication failed")
+      | _ -> "Authentication failed"
+    in
+    if String.sub code 0 (min 20 (String.length code)) = "Neo.ClientError.Secu" then
+      Lwt.return_error (AuthError message)
+    else
+      Lwt.return_error (ProtocolError (code, message))
+  | Ok (tag, _) ->
+    Lwt.return_error (ProtocolError ("UNEXPECTED", Printf.sprintf "Unexpected tag: %d" tag))
+  | Error e ->
+    Lwt.return_error e
+
+(** Connect to Neo4j server *)
+let connect ?(config=default_config) () =
+  try%lwt
+    (* Create socket connection *)
+    let addr = Unix.ADDR_INET (
+      (Unix.gethostbyname config.host).Unix.h_addr_list.(0),
+      config.port
+    ) in
+    let%lwt (ic, oc) = Lwt_io.open_connection addr in
+
+    (* Perform handshake *)
+    let%lwt version_result = handshake ic oc in
+    match version_result with
+    | Error e -> Lwt.return_error e
+    | Ok version ->
+      let conn = { ic; oc; version; timeout_s = config.timeout_s; server_info = [] } in
+      (* Authenticate *)
+      authenticate conn
+        ~username:config.username
+        ~password:config.password
+  with
+  | Unix.Unix_error (err, _, _) ->
+    Lwt.return_error (ConnectionError (Unix.error_message err))
+  | exn ->
+    Lwt.return_error (ConnectionError (Printexc.to_string exn))
+
+(** Close connection *)
+let close conn =
+  let%lwt () = send_message conn.oc Tag.goodbye [] in
+  let%lwt () = Lwt_io.close conn.oc in
+  Lwt_io.close conn.ic
+
+(** Execute a Cypher query *)
+let run conn ~cypher ?(params=Packstream.Map []) () =
+  (* Send RUN message *)
+  let extra = Packstream.Map [] in
+  let%lwt () = send_message conn.oc Tag.run [
+    Packstream.String cypher;
+    params;
+    extra;
+  ] in
+
+  (* Read RUN response (SUCCESS with metadata) *)
+  let%lwt run_response = recv_message ~timeout_s:conn.timeout_s conn.ic in
+  match run_response with
+  | Error e -> Lwt.return_error e
+  | Ok (tag, _) when tag = Tag.failure ->
+    Lwt.return_error (ProtocolError ("RUN_FAILED", "Query execution failed"))
+  | Ok (tag, _) when tag <> Tag.success ->
+    Lwt.return_error (ProtocolError ("UNEXPECTED", Printf.sprintf "Expected SUCCESS, got %d" tag))
+  | Ok _ ->
+    (* Send PULL message to get all results *)
+    let pull_extra = Packstream.Map [("n", Packstream.Int (-1L))] in
+    let%lwt () = send_message conn.oc Tag.pull [pull_extra] in
+
+    (* Collect all records (functional style - no ref) *)
+    let rec collect_records acc =
+      let%lwt response = recv_message ~timeout_s:conn.timeout_s conn.ic in
+      match response with
+      | Error e -> Lwt.return_error e
+      | Ok (tag, fields) when tag = Tag.record ->
+        collect_records (fields :: acc)
+      | Ok (tag, _) when tag = Tag.success ->
+        Lwt.return_ok (List.rev acc)
+      | Ok (tag, fields) when tag = Tag.failure ->
+        let code = match fields with
+          | [Packstream.Map m] ->
+            (match List.assoc_opt "code" m with
+             | Some (Packstream.String c) -> c
+             | _ -> "UNKNOWN")
+          | _ -> "UNKNOWN"
+        in
+        let message = match fields with
+          | [Packstream.Map m] ->
+            (match List.assoc_opt "message" m with
+             | Some (Packstream.String msg) -> msg
+             | _ -> "Query failed")
+          | _ -> "Query failed"
+        in
+        Lwt.return_error (ProtocolError (code, message))
+      | Ok (tag, _) ->
+        Lwt.return_error (ProtocolError ("UNEXPECTED", Printf.sprintf "Unexpected tag in PULL: %d" tag))
+    in
+    collect_records []
+
+(** Convert PackStream value to Yojson *)
+let rec packstream_to_yojson = function
+  | Packstream.Null -> `Null
+  | Packstream.Bool b -> `Bool b
+  | Packstream.Int n -> `Int (Int64.to_int n)
+  | Packstream.Float f -> `Float f
+  | Packstream.String s -> `String s
+  | Packstream.Bytes _ -> `String "<bytes>"
+  | Packstream.List items -> `List (List.map packstream_to_yojson items)
+  | Packstream.Map entries ->
+    `Assoc (List.map (fun (k, v) -> (k, packstream_to_yojson v)) entries)
+  | Packstream.Structure (tag, fields) ->
+    `Assoc [
+      ("_struct_tag", `Int tag);
+      ("fields", `List (List.map packstream_to_yojson fields));
+    ]
+
+(** Run query and return JSON result *)
+let query conn ~cypher ?(params=`Assoc []) () =
+  (* Convert Yojson params to PackStream *)
+  let rec yojson_to_packstream = function
+    | `Null -> Packstream.Null
+    | `Bool b -> Packstream.Bool b
+    | `Int n -> Packstream.Int (Int64.of_int n)
+    | `Float f -> Packstream.Float f
+    | `String s -> Packstream.String s
+    | `List items -> Packstream.List (List.map yojson_to_packstream items)
+    | `Assoc entries -> Packstream.Map (List.map (fun (k, v) -> (k, yojson_to_packstream v)) entries)
+    | _ -> Packstream.Null
+  in
+  let ps_params = yojson_to_packstream params in
+  let%lwt result = run conn ~cypher ~params:ps_params () in
+  match result with
+  | Error e -> Lwt.return_error e
+  | Ok records ->
+    let json_records = List.map (fun fields ->
+      `List (List.map packstream_to_yojson fields)
+    ) records in
+    Lwt.return_ok (`Assoc [("records", `List json_records)])
+
+(** Helper: extract first int from record result *)
+let extract_first_int records =
+  match records with
+  | [fields] ->
+    (match fields with
+     | [Packstream.Int n] -> Some n
+     | [Packstream.List items] ->
+       (match items with
+        | Packstream.Int n :: _ -> Some n
+        | _ -> None)
+     | _ -> None)
+  | _ -> None
+
+(** Test connection with simple query *)
+let test_connection conn =
+  let%lwt result = run conn ~cypher:"RETURN 1 as n" () in
+  match result with
+  | Ok records ->
+    (match extract_first_int records with
+     | Some 1L -> Lwt.return_ok true
+     | _ -> Lwt.return_ok false)
+  | Error e -> Lwt.return_error e
+
+(** Get node count for a label *)
+let count_nodes conn ~label =
+  let cypher = Printf.sprintf "MATCH (n:%s) RETURN count(n) as count" label in
+  let%lwt result = run conn ~cypher () in
+  match result with
+  | Ok records ->
+    (match extract_first_int records with
+     | Some count -> Lwt.return_ok (Int64.to_int count)
+     | None -> Lwt.return_ok 0)
+  | Error e -> Lwt.return_error e
