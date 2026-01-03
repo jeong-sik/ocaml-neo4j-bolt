@@ -48,6 +48,12 @@ let int32_to_version n =
   { major = Int32.to_int n land 0xFF;
     minor = Int32.to_int (Int32.shift_right n 8) land 0xFF }
 
+(** TLS mode for connection *)
+type tls_mode =
+  | NoTLS              (* bolt:// - plain TCP *)
+  | TLS                (* bolt+s:// - TLS with cert verification *)
+  | TLSSelfSigned      (* bolt+ssc:// - TLS without cert verification *)
+
 (** Configuration *)
 type config = {
   host: string;
@@ -55,19 +61,90 @@ type config = {
   username: string;
   password: string;
   timeout_s: float;
+  tls_mode: tls_mode;
 }
 
-let default_config = {
-  host = Sys.getenv_opt "NEO4J_HOST" |> Option.value ~default:"localhost";
-  port = (match Sys.getenv_opt "NEO4J_PORT" with
-    | Some p -> int_of_string_opt p |> Option.value ~default:7687
-    | None -> 7687);
-  username = Sys.getenv_opt "NEO4J_USERNAME" |> Option.value ~default:"neo4j";
-  password = Sys.getenv_opt "NEO4J_PASSWORD" |> Option.value ~default:"";
-  timeout_s = (match Sys.getenv_opt "NEO4J_TIMEOUT" with
-    | Some t -> float_of_string_opt t |> Option.value ~default:30.0
-    | None -> 30.0);
-}
+(** Parse URI to extract host, port, and TLS mode
+    Supported schemes: bolt://, bolt+s://, bolt+ssc://, bolts://
+*)
+let parse_uri uri =
+  let uri = String.trim uri in
+  (* Extract scheme *)
+  let scheme_end =
+    try String.index uri ':'
+    with Not_found -> 0
+  in
+  let scheme = String.lowercase_ascii (String.sub uri 0 scheme_end) in
+
+  (* Determine TLS mode from scheme *)
+  let tls_mode = match scheme with
+    | "bolt" -> NoTLS
+    | "bolt+s" | "bolts" -> TLS
+    | "bolt+ssc" -> TLSSelfSigned
+    | _ -> NoTLS  (* default to plain if unknown *)
+  in
+
+  (* Extract host:port from rest of URI *)
+  let rest_start =
+    if String.length uri > scheme_end + 3 &&
+       String.sub uri scheme_end 3 = "://"
+    then scheme_end + 3
+    else scheme_end + 1
+  in
+  let rest = String.sub uri rest_start (String.length uri - rest_start) in
+
+  (* Remove trailing path if any *)
+  let host_port =
+    try String.sub rest 0 (String.index rest '/')
+    with Not_found -> rest
+  in
+
+  (* Split host:port *)
+  let (host, port) =
+    try
+      let colon = String.rindex host_port ':' in
+      let h = String.sub host_port 0 colon in
+      let p = String.sub host_port (colon + 1) (String.length host_port - colon - 1) in
+      (h, int_of_string_opt p |> Option.value ~default:7687)
+    with Not_found -> (host_port, 7687)
+  in
+
+  (host, port, tls_mode)
+
+let default_config =
+  (* Check for URI first (preferred), then individual vars *)
+  let uri = Sys.getenv_opt "NEO4J_URI" in
+  match uri with
+  | Some u ->
+    let (host, port, tls_mode) = parse_uri u in
+    {
+      host;
+      port;
+      username = Sys.getenv_opt "NEO4J_USERNAME" |> Option.value ~default:"neo4j";
+      password = Sys.getenv_opt "NEO4J_PASSWORD" |> Option.value ~default:"";
+      timeout_s = (match Sys.getenv_opt "NEO4J_TIMEOUT" with
+        | Some t -> float_of_string_opt t |> Option.value ~default:30.0
+        | None -> 30.0);
+      tls_mode;
+    }
+  | None ->
+    {
+      host = Sys.getenv_opt "NEO4J_HOST" |> Option.value ~default:"localhost";
+      port = (match Sys.getenv_opt "NEO4J_PORT" with
+        | Some p -> int_of_string_opt p |> Option.value ~default:7687
+        | None -> 7687);
+      username = Sys.getenv_opt "NEO4J_USERNAME" |> Option.value ~default:"neo4j";
+      password = Sys.getenv_opt "NEO4J_PASSWORD" |> Option.value ~default:"";
+      timeout_s = (match Sys.getenv_opt "NEO4J_TIMEOUT" with
+        | Some t -> float_of_string_opt t |> Option.value ~default:30.0
+        | None -> 30.0);
+      tls_mode = NoTLS;
+    }
+
+(** Create config from URI string *)
+let config_from_uri ?(username="neo4j") ?(password="") ?(timeout_s=30.0) uri =
+  let (host, port, tls_mode) = parse_uri uri in
+  { host; port; username; password; timeout_s; tls_mode }
 
 (** Connection state *)
 type connection = {
@@ -76,6 +153,8 @@ type connection = {
   version: version;
   timeout_s: float;
   mutable server_info: (string * Packstream.value) list;
+  ssl_socket: Lwt_ssl.socket option;  (* For TLS connections *)
+  tls_mode: tls_mode;
 }
 
 (** Error types *)
@@ -216,22 +295,65 @@ let authenticate conn ~username ~password =
   | Error e ->
     Lwt.return_error e
 
-(** Connect to Neo4j server *)
+(** Create SSL context based on TLS mode *)
+let create_ssl_context = function
+  | NoTLS -> None
+  | TLS ->
+    let ctx = Ssl.create_context Ssl.TLSv1_2 Ssl.Client_context in
+    Ssl.set_verify ctx [Ssl.Verify_peer] None;
+    (* Use system CA certificates - ignore result/exception *)
+    let _ = try Ssl.set_default_verify_paths ctx with _ -> false in
+    Some ctx
+  | TLSSelfSigned ->
+    let ctx = Ssl.create_context Ssl.TLSv1_2 Ssl.Client_context in
+    (* No verification for self-signed certs *)
+    Ssl.set_verify ctx [] None;
+    Some ctx
+
+(** Connect to Neo4j server
+    Supports bolt://, bolt+s:// (TLS), and bolt+ssc:// (self-signed TLS)
+*)
 let connect ?(config=default_config) () =
   try%lwt
-    (* Create socket connection *)
-    let addr = Unix.ADDR_INET (
-      (Unix.gethostbyname config.host).Unix.h_addr_list.(0),
-      config.port
-    ) in
-    let%lwt (ic, oc) = Lwt_io.open_connection addr in
+    (* Resolve hostname *)
+    let host_entry = Unix.gethostbyname config.host in
+    let inet_addr = host_entry.Unix.h_addr_list.(0) in
+    let addr = Unix.ADDR_INET (inet_addr, config.port) in
 
-    (* Perform handshake *)
+    (* Create connection based on TLS mode *)
+    let%lwt (ic, oc, ssl_socket) =
+      match config.tls_mode with
+      | NoTLS ->
+        (* Plain TCP connection *)
+        let%lwt (ic, oc) = Lwt_io.open_connection addr in
+        Lwt.return (ic, oc, None)
+
+      | TLS | TLSSelfSigned as tls_mode ->
+        (* TLS connection using Lwt_ssl *)
+        let ctx = match create_ssl_context tls_mode with
+          | Some c -> c
+          | None -> failwith "Failed to create SSL context"
+        in
+        let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+        let%lwt () = Lwt_unix.connect fd addr in
+        let%lwt ssl_sock = Lwt_ssl.ssl_connect fd ctx in
+        let ic = Lwt_ssl.in_channel_of_descr ssl_sock in
+        let oc = Lwt_ssl.out_channel_of_descr ssl_sock in
+        Lwt.return (ic, oc, Some ssl_sock)
+    in
+
+    (* Perform Bolt handshake *)
     let%lwt version_result = handshake ic oc in
     match version_result with
     | Error e -> Lwt.return_error e
     | Ok version ->
-      let conn = { ic; oc; version; timeout_s = config.timeout_s; server_info = [] } in
+      let conn = {
+        ic; oc; version;
+        timeout_s = config.timeout_s;
+        server_info = [];
+        ssl_socket;
+        tls_mode = config.tls_mode;
+      } in
       (* Authenticate *)
       authenticate conn
         ~username:config.username
@@ -239,14 +361,23 @@ let connect ?(config=default_config) () =
   with
   | Unix.Unix_error (err, _, _) ->
     Lwt.return_error (ConnectionError (Unix.error_message err))
+  | Ssl.Connection_error _ | Ssl.Accept_error _ | Ssl.Read_error _ | Ssl.Write_error _ as e ->
+    Lwt.return_error (ConnectionError (Printf.sprintf "SSL error: %s" (Printexc.to_string e)))
   | exn ->
     Lwt.return_error (ConnectionError (Printexc.to_string exn))
 
 (** Close connection *)
 let close conn =
   let%lwt () = send_message conn.oc Tag.goodbye [] in
-  let%lwt () = Lwt_io.close conn.oc in
-  Lwt_io.close conn.ic
+  match conn.ssl_socket with
+  | Some ssl_sock ->
+    (* SSL connection - close properly *)
+    let%lwt () = Lwt_ssl.ssl_shutdown ssl_sock in
+    Lwt_ssl.close ssl_sock
+  | None ->
+    (* Plain connection *)
+    let%lwt () = Lwt_io.close conn.oc in
+    Lwt_io.close conn.ic
 
 (** Execute a Cypher query *)
 let run conn ~cypher ?(params=Packstream.Map []) () =
@@ -374,3 +505,31 @@ let count_nodes conn ~label =
      | Some count -> Lwt.return_ok (Int64.to_int count)
      | None -> Lwt.return_ok 0)
   | Error e -> Lwt.return_error e
+
+(** Connect using URI string (convenience function)
+    Examples:
+    - "bolt://localhost:7687"
+    - "bolt+s://neo4j.example.com:7687" (TLS)
+    - "bolt+ssc://neo4j.example.com:7687" (self-signed TLS)
+*)
+let connect_uri ~uri ~username ~password ?timeout_s () =
+  let config = config_from_uri ?timeout_s ~username ~password uri in
+  connect ~config ()
+
+(** Check if connection uses TLS *)
+let is_tls_connection conn =
+  match conn.tls_mode with
+  | NoTLS -> false
+  | TLS | TLSSelfSigned -> true
+
+(** Get TLS mode description *)
+let tls_mode_to_string = function
+  | NoTLS -> "plain"
+  | TLS -> "tls"
+  | TLSSelfSigned -> "tls-self-signed"
+
+(** Get connection info as string *)
+let connection_info conn =
+  let tls_str = tls_mode_to_string conn.tls_mode in
+  Printf.sprintf "Neo4j Bolt %d.%d (%s)"
+    conn.version.major conn.version.minor tls_str

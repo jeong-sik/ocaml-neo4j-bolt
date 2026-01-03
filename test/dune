@@ -1,3 +1,16 @@
 (test
  (name test_packstream)
+ (modules test_packstream)
  (libraries neo4j_bolt alcotest))
+
+(test
+ (name test_bolt)
+ (modules test_bolt)
+ (libraries neo4j_bolt alcotest))
+
+; Integration test (manual run - connects to real Neo4j)
+(executable
+ (name integration_test)
+ (modules integration_test)
+ (libraries neo4j_bolt lwt.unix)
+ (preprocess (pps lwt_ppx)))
