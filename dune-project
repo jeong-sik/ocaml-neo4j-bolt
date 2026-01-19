@@ -1,6 +1,6 @@
 (lang dune 3.0)
 (name neo4j_bolt)
-(version 0.3.0)
+(version 0.4.0)
 (license MIT)
 (authors "Jeongshik Yoon <yousleepwhen@gmail.com>")
 (maintainers "Jeongshik Yoon <yousleepwhen@gmail.com>")
@@ -9,10 +9,11 @@
 
 (generate_opam_files true)
 
+; Main package (Lwt version)
 (package
  (name neo4j_bolt)
- (synopsis "Pure OCaml Neo4j Bolt protocol client with TLS support")
- (description "A pure OCaml implementation of the Neo4j Bolt protocol with TLS/SSL support. Supports bolt://, bolt+s://, and bolt+ssc:// connection schemes.")
+ (synopsis "Pure OCaml Neo4j Bolt protocol client with TLS support (Lwt)")
+ (description "A pure OCaml implementation of the Neo4j Bolt protocol with TLS/SSL support. Uses Lwt for async I/O. Supports bolt://, bolt+s://, and bolt+ssc:// connection schemes.")
  (depends
   (ocaml (>= 4.14))
   (dune (>= 3.0))
@@ -20,4 +21,17 @@
   (lwt_ppx (>= 2.1))
   (lwt_ssl (>= 1.2))
   (ssl (>= 0.7))
+  (yojson (>= 2.0))))
+
+; Eio version package
+(package
+ (name neo4j_bolt_eio)
+ (synopsis "Pure OCaml Neo4j Bolt protocol client (Eio)")
+ (description "A pure OCaml implementation of the Neo4j Bolt protocol using Eio for direct-style async I/O. Supports bolt:// connections.")
+ (depends
+  (ocaml (>= 5.0))
+  (dune (>= 3.0))
+  (eio (>= 1.0))
+  (eio_main (>= 1.0))
+  (tls-eio (>= 1.0))
   (yojson (>= 2.0))))

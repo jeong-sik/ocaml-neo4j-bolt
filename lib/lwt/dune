@@ -1,5 +1,5 @@
 (library
  (name neo4j_bolt)
  (public_name neo4j_bolt)
- (libraries lwt lwt.unix lwt_ssl ssl)
+ (libraries neo4j_packstream lwt lwt.unix lwt_ssl)
  (preprocess (pps lwt_ppx)))
