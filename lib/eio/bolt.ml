@@ -320,16 +320,13 @@ let authenticate conn ~username ~password =
     @param config Connection configuration *)
 let connect ~sw ~net ~clock ?(config=default_config) () =
   try
-    let addr = `Tcp (Eio.Net.Ipaddr.of_raw (Unix.inet_addr_of_string config.host |> Obj.magic), config.port) in
-    (* For hostname resolution, we need to handle it *)
-    let addr =
-      try addr
-      with _ ->
-        (* Fallback: resolve hostname *)
-        let host_entry = Unix.gethostbyname config.host in
-        let ip = host_entry.Unix.h_addr_list.(0) in
-        `Tcp (Eio.Net.Ipaddr.of_raw (Obj.magic ip), config.port)
-    in
+    (* Resolve hostname using Eio's DNS resolver - no Obj.magic! *)
+    let service = string_of_int config.port in
+    let addrs = Eio.Net.getaddrinfo_stream net config.host ~service in
+    match addrs with
+    | [] ->
+      Error (ConnectionError (Printf.sprintf "Could not resolve host: %s" config.host))
+    | addr :: _ ->
     let flow = Eio.Net.connect ~sw net addr in
 
     (* TODO: TLS support with tls-eio *)
@@ -504,9 +501,9 @@ let count_nodes ~clock conn ~label =
   | Error e -> Error e
 
 (** Connect using URI string *)
-let connect_uri ~net ~clock ~uri ~username ~password ?timeout_s () =
+let connect_uri ~sw ~net ~clock ~uri ~username ~password ?timeout_s () =
   let config = config_from_uri ?timeout_s ~username ~password uri in
-  connect ~net ~clock ~config ()
+  connect ~sw ~net ~clock ~config ()
 
 (** Check if connection uses TLS *)
 let is_tls_connection conn =
