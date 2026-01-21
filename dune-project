@@ -9,6 +9,15 @@
 
 (generate_opam_files true)
 
+; PackStream serialization library (shared by both Lwt and Eio versions)
+(package
+ (name neo4j_packstream)
+ (synopsis "PackStream binary serialization format for Neo4j Bolt protocol")
+ (description "Pure OCaml implementation of PackStream, the binary serialization format used by Neo4j's Bolt protocol. No async dependencies - can be used with any runtime.")
+ (depends
+  (ocaml (>= 4.14))
+  (dune (>= 3.0))))
+
 ; Main package (Lwt version)
 (package
  (name neo4j_bolt)
@@ -17,6 +26,7 @@
  (depends
   (ocaml (>= 4.14))
   (dune (>= 3.0))
+  (neo4j_packstream (= :version))
   (lwt (>= 5.6))
   (lwt_ppx (>= 2.1))
   (lwt_ssl (>= 1.2))
@@ -31,6 +41,7 @@
  (depends
   (ocaml (>= 5.0))
   (dune (>= 3.0))
+  (neo4j_packstream (= :version))
   (eio (>= 1.0))
   (eio_main (>= 1.0))
   (tls-eio (>= 1.0))

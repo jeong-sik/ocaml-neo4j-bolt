@@ -13,6 +13,7 @@ bug-reports: "https://github.com/jeong-sik/ocaml-neo4j-bolt/issues"
 depends: [
   "ocaml" {>= "5.0"}
   "dune" {>= "3.0" & >= "3.0"}
+  "neo4j_packstream" {= version}
   "eio" {>= "1.0"}
   "eio_main" {>= "1.0"}
   "tls-eio" {>= "1.0"}

@@ -1,5 +1,5 @@
 (library
  (name neo4j_packstream)
- (public_name neo4j_bolt.packstream)
+ (public_name neo4j_packstream)
  (wrapped false)
  (libraries bytes))
