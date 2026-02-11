@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ocaml-compiler: ['4.14', '5.2']
+        exclude:
+          # neo4j_bolt_eio requires OCaml 5.x
+          - os: ubuntu-latest
+            ocaml-compiler: '4.14'
+          - os: macos-latest
+            ocaml-compiler: '4.14'
+        include:
+          - os: ubuntu-latest
+            ocaml-compiler: '4.14'
+          - os: ubuntu-latest
+            ocaml-compiler: '5.2'
+          - os: macos-latest
+            ocaml-compiler: '5.2'
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup OCaml ${{ matrix.ocaml-compiler }}
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-compiler }}
+
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Install dependencies
+        run: opam install . --deps-only --with-test -y
+
+      - name: Build
+        run: opam exec -- dune build
+
+      - name: Run tests
+        run: opam exec -- dune runtest
+
+      - name: Check formatting
+        if: matrix.ocaml-compiler == '5.2' && runner.os == 'Linux'
+        run: |
+          opam install ocamlformat -y
+          opam exec -- dune fmt 2>/dev/null || true

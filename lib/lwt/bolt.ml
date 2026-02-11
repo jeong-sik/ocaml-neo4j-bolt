@@ -315,10 +315,14 @@ let create_ssl_context = function
 *)
 let connect ?(config=default_config) () =
   try%lwt
-    (* Resolve hostname *)
-    let host_entry = Unix.gethostbyname config.host in
-    let inet_addr = host_entry.Unix.h_addr_list.(0) in
-    let addr = Unix.ADDR_INET (inet_addr, config.port) in
+    (* Resolve hostname — non-blocking via Lwt_unix.getaddrinfo *)
+    let%lwt addrs = Lwt_unix.getaddrinfo config.host (string_of_int config.port)
+        [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_FAMILY Unix.PF_INET] in
+    let ai = match addrs with
+      | [] -> failwith (Printf.sprintf "DNS resolution failed for %s" config.host)
+      | ai :: _ -> ai
+    in
+    let addr = ai.Unix.ai_addr in
 
     (* Create connection based on TLS mode *)
     let%lwt (ic, oc, ssl_socket) =
