@@ -33,6 +33,7 @@
   (lwt_ssl (>= 1.2))
   (ssl (>= 0.7))
   (yojson (>= 2.0))
+  (alcotest :with-test)
   (bisect_ppx (and :with-test (>= 2.8)))))
 
 ; Eio version package

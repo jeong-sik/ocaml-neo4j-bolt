@@ -19,6 +19,7 @@ depends: [
   "lwt_ssl" {>= "1.2"}
   "ssl" {>= "0.7"}
   "yojson" {>= "2.0"}
+  "alcotest" {with-test}
   "bisect_ppx" {with-test & >= "2.8"}
   "odoc" {with-doc}
 ]
