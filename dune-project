@@ -1,6 +1,6 @@
 (lang dune 3.13)
 (name neo4j_bolt)
-(version 0.5.0)
+(version 0.5.1)
 (license MIT)
 (authors "Jeongshik Yoon <yousleepwhen@gmail.com>")
 (maintainers "Jeongshik Yoon <yousleepwhen@gmail.com>")

@@ -57,6 +57,33 @@ let test_tls_mode_strings () =
   Alcotest.(check string) "tls" "tls" (B.tls_mode_to_string B.TLS);
   Alcotest.(check string) "self-signed" "tls-self-signed" (B.tls_mode_to_string B.TLSSelfSigned)
 
+let with_env name value f =
+  let original = Sys.getenv_opt name in
+  (match value with
+   | Some v -> Unix.putenv name v
+   | None -> Unix.putenv name "");
+  Fun.protect
+    ~finally:(fun () ->
+      match original with
+      | Some v -> Unix.putenv name v
+      | None -> Unix.putenv name "")
+    f
+
+let test_insecure_tls_opt_in_default_false () =
+  with_env "ALLOW_INSECURE_TLS" None @@ fun () ->
+  with_env "NEO4J_ALLOW_INSECURE_TLS" None @@ fun () ->
+  Alcotest.(check bool) "default false" false (B.insecure_tls_opt_in_enabled ())
+
+let test_insecure_tls_opt_in_primary_env () =
+  with_env "ALLOW_INSECURE_TLS" (Some "1") @@ fun () ->
+  with_env "NEO4J_ALLOW_INSECURE_TLS" None @@ fun () ->
+  Alcotest.(check bool) "ALLOW_INSECURE_TLS=1" true (B.insecure_tls_opt_in_enabled ())
+
+let test_insecure_tls_opt_in_legacy_env () =
+  with_env "ALLOW_INSECURE_TLS" None @@ fun () ->
+  with_env "NEO4J_ALLOW_INSECURE_TLS" (Some "true") @@ fun () ->
+  Alcotest.(check bool) "NEO4J_ALLOW_INSECURE_TLS=true" true (B.insecure_tls_opt_in_enabled ())
+
 (* Test suites *)
 let () =
   Alcotest.run "Bolt" [
@@ -73,5 +100,10 @@ let () =
     ];
     "tls_mode", [
       ("mode strings", `Quick, test_tls_mode_strings);
+    ];
+    "security", [
+      ("insecure tls opt-in default false", `Quick, test_insecure_tls_opt_in_default_false);
+      ("insecure tls opt-in primary env", `Quick, test_insecure_tls_opt_in_primary_env);
+      ("insecure tls opt-in legacy env", `Quick, test_insecure_tls_opt_in_legacy_env);
     ];
   ]
