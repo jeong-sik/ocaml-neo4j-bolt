@@ -55,6 +55,21 @@ type tls_mode =
   | TLS                (* bolt+s:// - TLS with cert verification *)
   | TLSSelfSigned      (* bolt+ssc:// - TLS without cert verification *)
 
+(** Normalize env values for boolean checks *)
+let normalize_lower s = String.lowercase_ascii (String.trim s)
+
+let env_truthy name =
+  match Sys.getenv_opt name with
+  | Some v ->
+    let v = normalize_lower v in
+    v = "1" || v = "true" || v = "yes"
+  | None -> false
+
+(** Explicit opt-in required for insecure TLS mode *)
+let insecure_tls_opt_in_enabled () =
+  env_truthy "ALLOW_INSECURE_TLS"
+  || env_truthy "NEO4J_ALLOW_INSECURE_TLS"
+
 (** Configuration *)
 type config = {
   host: string;
@@ -319,7 +334,16 @@ let authenticate conn ~username ~password =
     @param clock Eio clock for timeouts
     @param config Connection configuration *)
 let connect ~sw ~net ~clock ?(config=default_config) () =
+  if config.tls_mode = TLSSelfSigned && not (insecure_tls_opt_in_enabled ()) then
+    Error
+      (ConnectionError
+         "Refusing TLSSelfSigned without explicit opt-in. Set ALLOW_INSECURE_TLS=1 (or NEO4J_ALLOW_INSECURE_TLS=1) for development only.")
+  else
   try
+    if config.tls_mode = TLSSelfSigned then
+      Printf.eprintf
+        "neo4j_bolt_eio: WARNING insecure TLS mode enabled for %s:%d (certificate verification disabled)\n%!"
+        config.host config.port;
     (* Resolve hostname using Eio's DNS resolver - no Obj.magic! *)
     let service = string_of_int config.port in
     let addrs = Eio.Net.getaddrinfo_stream net config.host ~service in

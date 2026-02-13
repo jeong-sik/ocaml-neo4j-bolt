@@ -54,6 +54,21 @@ type tls_mode =
   | TLS                (* bolt+s:// - TLS with cert verification *)
   | TLSSelfSigned      (* bolt+ssc:// - TLS without cert verification *)
 
+(** Normalize env values for boolean checks *)
+let normalize_lower s = String.lowercase_ascii (String.trim s)
+
+let env_truthy name =
+  match Sys.getenv_opt name with
+  | Some v ->
+    let v = normalize_lower v in
+    v = "1" || v = "true" || v = "yes"
+  | None -> false
+
+(** Explicit opt-in required for insecure TLS mode *)
+let insecure_tls_opt_in_enabled () =
+  env_truthy "ALLOW_INSECURE_TLS"
+  || env_truthy "NEO4J_ALLOW_INSECURE_TLS"
+
 (** Configuration *)
 type config = {
   host: string;
@@ -314,7 +329,16 @@ let create_ssl_context = function
     Supports bolt://, bolt+s:// (TLS), and bolt+ssc:// (self-signed TLS)
 *)
 let connect ?(config=default_config) () =
+  if config.tls_mode = TLSSelfSigned && not (insecure_tls_opt_in_enabled ()) then
+    Lwt.return_error
+      (ConnectionError
+         "Refusing TLSSelfSigned without explicit opt-in. Set ALLOW_INSECURE_TLS=1 (or NEO4J_ALLOW_INSECURE_TLS=1) for development only.")
+  else
   try%lwt
+    if config.tls_mode = TLSSelfSigned then
+      Printf.eprintf
+        "neo4j_bolt: WARNING insecure TLS mode enabled for %s:%d (certificate verification disabled)\n%!"
+        config.host config.port;
     (* Resolve hostname — non-blocking via Lwt_unix.getaddrinfo *)
     let%lwt addrs = Lwt_unix.getaddrinfo config.host (string_of_int config.port)
         [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_FAMILY Unix.PF_INET] in
