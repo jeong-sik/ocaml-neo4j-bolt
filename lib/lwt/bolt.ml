@@ -303,8 +303,14 @@ let create_ssl_context = function
   | TLS ->
     let ctx = Ssl.create_context Ssl.TLSv1_2 Ssl.Client_context in
     Ssl.set_verify ctx [Ssl.Verify_peer] None;
-    (* Use system CA certificates - ignore result/exception *)
-    let _ = try Ssl.set_default_verify_paths ctx with _ -> false in
+    (* Use system CA certificates *)
+    (let ok = try Ssl.set_default_verify_paths ctx with exn ->
+       Printf.eprintf "neo4j_bolt: WARNING: exception loading system CA certificates: %s\n%!"
+         (Printexc.to_string exn);
+       false
+     in
+     if not ok then
+       Printf.eprintf "neo4j_bolt: WARNING: failed to load system CA certificates; peer verification may fail\n%!");
     Some ctx
   | TLSSelfSigned ->
     let ctx = Ssl.create_context Ssl.TLSv1_2 Ssl.Client_context in
