@@ -272,8 +272,11 @@ let recv_message reader =
     match value with
     | Packstream.Structure (tag, fields) -> Ok (tag, fields)
     | _ -> Error (ProtocolError ("UNEXPECTED", "Expected structure"))
-  with exn ->
-    Error (ProtocolError ("PARSE", Printexc.to_string exn))
+  with
+  | Failure msg -> Error (ProtocolError ("PARSE", msg))
+  | Invalid_argument msg -> Error (ProtocolError ("PARSE", msg))
+  | End_of_file -> Error (ProtocolError ("PARSE", "Unexpected end of stream"))
+  | exn -> Error (ProtocolError ("PARSE_UNKNOWN", Printexc.to_string exn))
 
 (** Send HELLO message and authenticate *)
 let authenticate conn ~username ~password =
@@ -353,7 +356,7 @@ let connect ~sw ~net ~clock ?(config=default_config) () =
           (fun () ->
             Eio.Time.sleep clock config.timeout_s;
             `Timeout)
-      with exn ->
+      with Eio.Io _ as exn ->
         `Error (ConnectionError (Printexc.to_string exn))
     in
     match handshake_result with
@@ -373,8 +376,12 @@ let connect ~sw ~net ~clock ?(config=default_config) () =
   with
   | Unix.Unix_error (err, _, _) ->
     Error (ConnectionError (Unix.error_message err))
-  | exn ->
+  | Eio.Io _ as exn ->
     Error (ConnectionError (Printexc.to_string exn))
+  | Failure msg ->
+    Error (ConnectionError ("Internal failure: " ^ msg))
+  | Invalid_argument msg ->
+    Error (ConnectionError ("Invalid argument: " ^ msg))
 
 (** Close connection *)
 let close conn =
