@@ -339,13 +339,19 @@ let connect ?(config=default_config) () =
     (* Resolve hostname — non-blocking via Lwt_unix.getaddrinfo *)
     let%lwt addrs = Lwt_unix.getaddrinfo config.host (string_of_int config.port)
         [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_FAMILY Unix.PF_INET] in
-    let ai = match addrs with
-      | [] -> failwith (Printf.sprintf "DNS resolution failed for %s" config.host)
-      | ai :: _ -> ai
-    in
+    match addrs with
+    | [] ->
+      Lwt.return_error
+        (ConnectionError (Printf.sprintf "DNS resolution failed for %s" config.host))
+    | ai :: _ ->
     let addr = ai.Unix.ai_addr in
 
     (* Create connection based on TLS mode *)
+    match create_ssl_context config.tls_mode with
+    | None when config.tls_mode <> NoTLS ->
+      Lwt.return_error
+        (ConnectionError "TLS connection refused: system CA certificates unavailable")
+    | ssl_ctx ->
     let%lwt (ic, oc, ssl_socket) =
       match config.tls_mode with
       | NoTLS ->
@@ -353,12 +359,9 @@ let connect ?(config=default_config) () =
         let%lwt (ic, oc) = Lwt_io.open_connection addr in
         Lwt.return (ic, oc, None)
 
-      | TLS | TLSSelfSigned as tls_mode ->
+      | TLS | TLSSelfSigned ->
         (* TLS connection using Lwt_ssl *)
-        let ctx = match create_ssl_context tls_mode with
-          | Some c -> c
-          | None -> failwith "TLS connection refused: system CA certificates unavailable"
-        in
+        let ctx = Option.get ssl_ctx in
         let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
         let%lwt () = Lwt_unix.connect fd addr in
         let%lwt ssl_sock = Lwt_ssl.ssl_connect fd ctx in
@@ -388,8 +391,10 @@ let connect ?(config=default_config) () =
     Lwt.return_error (ConnectionError (Unix.error_message err))
   | Ssl.Connection_error _ | Ssl.Accept_error _ | Ssl.Read_error _ | Ssl.Write_error _ as e ->
     Lwt.return_error (ConnectionError (Printf.sprintf "SSL error: %s" (Printexc.to_string e)))
-  | exn ->
-    Lwt.return_error (ConnectionError (Printexc.to_string exn))
+  | Failure msg ->
+    Lwt.return_error (ConnectionError ("Internal failure: " ^ msg))
+  | Invalid_argument msg ->
+    Lwt.return_error (ConnectionError ("Invalid argument: " ^ msg))
 
 (** Close connection *)
 let close conn =
