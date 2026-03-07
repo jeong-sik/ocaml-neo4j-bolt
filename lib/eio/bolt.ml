@@ -275,6 +275,8 @@ let recv_message reader =
   with
   | Failure msg -> Error (ProtocolError ("PARSE", msg))
   | Invalid_argument msg -> Error (ProtocolError ("PARSE", msg))
+  | End_of_file -> Error (ProtocolError ("PARSE", "Unexpected end of stream"))
+  | exn -> Error (ProtocolError ("PARSE_UNKNOWN", Printexc.to_string exn))
 
 (** Send HELLO message and authenticate *)
 let authenticate conn ~username ~password =
@@ -376,6 +378,10 @@ let connect ~sw ~net ~clock ?(config=default_config) () =
     Error (ConnectionError (Unix.error_message err))
   | Eio.Io _ as exn ->
     Error (ConnectionError (Printexc.to_string exn))
+  | Failure msg ->
+    Error (ConnectionError ("Internal failure: " ^ msg))
+  | Invalid_argument msg ->
+    Error (ConnectionError ("Invalid argument: " ^ msg))
 
 (** Close connection *)
 let close conn =
