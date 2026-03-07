@@ -339,10 +339,11 @@ let connect ?(config=default_config) () =
     (* Resolve hostname — non-blocking via Lwt_unix.getaddrinfo *)
     let%lwt addrs = Lwt_unix.getaddrinfo config.host (string_of_int config.port)
         [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_FAMILY Unix.PF_INET] in
-    let ai = match addrs with
-      | [] -> failwith (Printf.sprintf "DNS resolution failed for %s" config.host)
-      | ai :: _ -> ai
-    in
+    match addrs with
+    | [] ->
+      Lwt.return_error
+        (ConnectionError (Printf.sprintf "DNS resolution failed for %s" config.host))
+    | ai :: _ ->
     let addr = ai.Unix.ai_addr in
 
     (* Create connection based on TLS mode *)
@@ -357,7 +358,8 @@ let connect ?(config=default_config) () =
         (* TLS connection using Lwt_ssl *)
         let ctx = match create_ssl_context tls_mode with
           | Some c -> c
-          | None -> failwith "TLS connection refused: system CA certificates unavailable"
+          | None ->
+            failwith "TLS connection refused: system CA certificates unavailable"
         in
         let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
         let%lwt () = Lwt_unix.connect fd addr in
@@ -388,7 +390,13 @@ let connect ?(config=default_config) () =
     Lwt.return_error (ConnectionError (Unix.error_message err))
   | Ssl.Connection_error _ | Ssl.Accept_error _ | Ssl.Read_error _ | Ssl.Write_error _ as e ->
     Lwt.return_error (ConnectionError (Printf.sprintf "SSL error: %s" (Printexc.to_string e)))
+  | Failure msg ->
+    Lwt.return_error (ConnectionError ("Internal failure: " ^ msg))
+  | Invalid_argument msg ->
+    Lwt.return_error (ConnectionError ("Invalid argument: " ^ msg))
   | exn ->
+    Printf.eprintf "neo4j_bolt: unexpected exception in connect: %s\n%!"
+      (Printexc.to_string exn);
     Lwt.return_error (ConnectionError (Printexc.to_string exn))
 
 (** Close connection *)
