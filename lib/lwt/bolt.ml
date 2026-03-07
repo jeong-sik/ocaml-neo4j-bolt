@@ -303,15 +303,19 @@ let create_ssl_context = function
   | TLS ->
     let ctx = Ssl.create_context Ssl.TLSv1_2 Ssl.Client_context in
     Ssl.set_verify ctx [Ssl.Verify_peer] None;
-    (* Use system CA certificates *)
-    (let ok = try Ssl.set_default_verify_paths ctx with exn ->
-       Printf.eprintf "neo4j_bolt: WARNING: exception loading system CA certificates: %s\n%!"
-         (Printexc.to_string exn);
-       false
-     in
-     if not ok then
-       Printf.eprintf "neo4j_bolt: WARNING: failed to load system CA certificates; peer verification may fail\n%!");
-    Some ctx
+    (* Use system CA certificates — fail-closed: no ctx if CA certs unavailable *)
+    let ca_ok =
+      try Ssl.set_default_verify_paths ctx
+      with exn ->
+        Printf.eprintf "neo4j_bolt: WARNING: exception loading system CA certificates: %s\n%!"
+          (Printexc.to_string exn);
+        false
+    in
+    if ca_ok then Some ctx
+    else begin
+      Printf.eprintf "neo4j_bolt: ERROR: failed to load system CA certificates; refusing TLS connection\n%!";
+      None
+    end
   | TLSSelfSigned ->
     let ctx = Ssl.create_context Ssl.TLSv1_2 Ssl.Client_context in
     (* No verification for self-signed certs *)
@@ -353,7 +357,7 @@ let connect ?(config=default_config) () =
         (* TLS connection using Lwt_ssl *)
         let ctx = match create_ssl_context tls_mode with
           | Some c -> c
-          | None -> failwith "Failed to create SSL context"
+          | None -> failwith "TLS connection refused: system CA certificates unavailable"
         in
         let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
         let%lwt () = Lwt_unix.connect fd addr in
