@@ -347,11 +347,6 @@ let connect ?(config=default_config) () =
     let addr = ai.Unix.ai_addr in
 
     (* Create connection based on TLS mode *)
-    match create_ssl_context config.tls_mode with
-    | None when config.tls_mode <> NoTLS ->
-      Lwt.return_error
-        (ConnectionError "TLS connection refused: system CA certificates unavailable")
-    | ssl_ctx ->
     let%lwt (ic, oc, ssl_socket) =
       match config.tls_mode with
       | NoTLS ->
@@ -359,9 +354,13 @@ let connect ?(config=default_config) () =
         let%lwt (ic, oc) = Lwt_io.open_connection addr in
         Lwt.return (ic, oc, None)
 
-      | TLS | TLSSelfSigned ->
+      | TLS | TLSSelfSigned as tls_mode ->
         (* TLS connection using Lwt_ssl *)
-        let ctx = Option.get ssl_ctx in
+        let ctx = match create_ssl_context tls_mode with
+          | Some c -> c
+          | None ->
+            failwith "TLS connection refused: system CA certificates unavailable"
+        in
         let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
         let%lwt () = Lwt_unix.connect fd addr in
         let%lwt ssl_sock = Lwt_ssl.ssl_connect fd ctx in
@@ -395,6 +394,10 @@ let connect ?(config=default_config) () =
     Lwt.return_error (ConnectionError ("Internal failure: " ^ msg))
   | Invalid_argument msg ->
     Lwt.return_error (ConnectionError ("Invalid argument: " ^ msg))
+  | exn ->
+    Printf.eprintf "neo4j_bolt: unexpected exception in connect: %s\n%!"
+      (Printexc.to_string exn);
+    Lwt.return_error (ConnectionError (Printexc.to_string exn))
 
 (** Close connection *)
 let close conn =
