@@ -54,20 +54,7 @@ type tls_mode =
   | TLS                (* bolt+s:// - TLS with cert verification *)
   | TLSSelfSigned      (* bolt+ssc:// - TLS without cert verification *)
 
-(** Normalize env values for boolean checks *)
-let normalize_lower s = String.lowercase_ascii (String.trim s)
-
-let env_truthy name =
-  match Sys.getenv_opt name with
-  | Some v ->
-    let v = normalize_lower v in
-    v = "1" || v = "true" || v = "yes"
-  | None -> false
-
-(** Explicit opt-in required for insecure TLS mode *)
-let insecure_tls_opt_in_enabled () =
-  env_truthy "ALLOW_INSECURE_TLS"
-  || env_truthy "NEO4J_ALLOW_INSECURE_TLS"
+let insecure_tls_opt_in_enabled = Bolt_common.insecure_tls_opt_in_enabled
 
 (** Configuration *)
 type config = {

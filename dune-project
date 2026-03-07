@@ -9,6 +9,16 @@
 
 (generate_opam_files true)
 
+; Shared utilities (backend-agnostic, no Lwt/Eio dependency)
+(package
+ (name neo4j_bolt_common)
+ (synopsis "Shared utilities for Neo4j Bolt protocol clients")
+ (description "Backend-agnostic helper functions shared by both the Lwt and Eio Neo4j Bolt protocol clients.")
+ (depends
+  (ocaml (>= 4.14))
+  (dune (>= 3.13))
+  (bisect_ppx (and :with-test (>= 2.8)))))
+
 ; PackStream serialization library (shared by both Lwt and Eio versions)
 (package
  (name neo4j_packstream)
@@ -27,6 +37,7 @@
  (depends
   (ocaml (>= 4.14))
   (dune (>= 3.13))
+  (neo4j_bolt_common (= :version))
   (neo4j_packstream (= :version))
   (lwt (>= 5.6))
   (lwt_ppx (>= 2.1))
@@ -44,6 +55,7 @@
  (depends
   (ocaml (>= 5.0))
   (dune (>= 3.13))
+  (neo4j_bolt_common (= :version))
   (neo4j_packstream (= :version))
   (eio (>= 1.0))
   (eio_main (>= 1.0))
